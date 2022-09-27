@@ -1,0 +1,126 @@
+version: 0.2
+    
+phases:
+  install:
+    commands:
+      - echo "Installing app dependencies..."
+      - curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+      - mv /tmp/eksctl /usr/local/bin
+      - eksctl version
+      - echo "Install kubectl" 
+      - curl -O https://amazon-eks.s3.us-west-2.amazonaws.com/1.15.10/2020-02-22/bin/linux/amd64/kubectl   
+      - chmod +x ./kubectl
+      - mkdir -p $HOME/bin && cp ./kubectl $HOME/bin/kubectl && export PATH=$PATH:$HOME/bin
+      - echo 'export PATH=$PATH:$HOME/bin' >> ~/.bashrc
+      - source ~/.bashrc
+    
+  pre_build:
+    commands:
+      - echo Building the Docker image...
+      - docker login -u $DOCKER_USER -p $DOCKER_PASSWORD
+      - docker build -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$TAG .
+      - echo Pushing the Docker image...
+      - $(aws ecr get-login --no-include-email --region ${AWS_DEFAULT_REGION})
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME
+      - echo Entered the pre_build phase...
+      - aws sts get-caller-identity
+      #- echo "Creating IAM OIDC provider based on the create-open-id-connect-provider.json"
+      #- eksctl utils associate-iam-oidc-provider --region "$AWS_DEFAULT_REGION" --cluster "$AWS_CLUSTER_NAME" --approve
+      - echo "Create an IAM policy" 
+      - |
+        cat > elasticsearch-role-policy.json <<EOF
+        {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                          "s3:ListBucket",
+                          "s3:PutObject",
+                          "s3:GetObject",
+                          "s3:DeleteObject"
+                        ],
+                        "Resource": [
+                           "arn:aws:s3:::${EFK_BUCKET_NAME}",
+                           "arn:aws:s3:::${EFK_BUCKET_NAME}/*"
+                        ]
+                    }
+                ]
+        }
+        EOF
+      #- aws iam create-policy --policy-name ElasticSearchPolicy-Production --policy-document file://elasticsearch-role-policy.json
+      - |
+          POLICY_EXISTS=$(aws iam list-policies --scope Local | jq -r '.Policies[] .PolicyName | select(.=="ElasticSearchPolicy-Production")')
+          if [ -z "$POLICY_EXISTS" ]
+          then
+            aws iam create-policy --policy-name ElasticSearchPolicy-Production --policy-document file://elasticsearch-role-policy.json
+          else
+            echo "Policy already exists"
+          fi
+      - OIDC=$(aws eks describe-cluster --name $AWS_CLUSTER_NAME --query "cluster.identity.oidc.issuer" --region $AWS_DEFAULT_REGION --output text)
+      - OIDC_PROVIDER=$(echo $OIDC | sed 's/https\?:\/\///')
+
+  build:
+    commands:
+      - echo Entered the build phase...
+      - echo Logging in to Amazon EKS...
+      - aws eks --region "$AWS_DEFAULT_REGION" update-kubeconfig --name "$AWS_CLUSTER_NAME"
+      - echo "Create IAM service account"
+      - |
+        NAMESPACE=$(kubectl get namespaces  -o json | jq -r '.items[].metadata.name | select(.=="monitoring")')
+        if [ -z "$NAMESPACE" ]
+        then
+           kubectl create namespace "monitoring"
+        else
+          echo "Namespace already exists"
+        fi
+      - sed "s/<AWS_ACCOUNT_ID>/$AWS_ACCOUNT_ID/g" elasticsearch-service-account-template.yaml > elasticsearch-service-account.yaml
+      - |
+           cat > elasticsearch-role-trust-policy.json <<EOF
+           {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {
+                            "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/$OIDC_PROVIDER"
+                        },
+                        "Action": "sts:AssumeRoleWithWebIdentity",
+                        "Condition": {
+                            "StringEquals": {
+                                "$OIDC_PROVIDER:aud": "sts.amazonaws.com",
+                                "$OIDC_PROVIDER:sub": "system:serviceaccount:monitoring:elasticsearch-sa"
+                            }
+                        }
+                    }
+                ]
+            }
+           EOF
+      - cat "elasticsearch-role-trust-policy.json"
+      - |
+          ROLE_EXISTS=$(aws iam list-roles | jq -r '.Roles[] .RoleName | select (.=="elasticSearchRole-production")')
+          if [ -z "$ROLE_EXISTS" ]
+          then
+            aws iam create-role --role-name elasticSearchRole-production --assume-role-policy-document file://"elasticsearch-role-trust-policy.json"
+          else
+            echo "Role already exists"
+          fi
+      #- aws iam create-role --role-name elasticSearchRole-production --assume-role-policy-document file://"elasticsearch-role-trust-policy.json"
+      - aws iam attach-role-policy --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/ElasticSearchPolicy-Production --role-name elasticSearchRole-production
+      - kubectl apply -f elasticsearch-service-account.yaml
+      - kubectl apply -f elasticsearch-master.yaml 
+      - kubectl apply -f elasticsearch-data.yaml 
+      - kubectl apply -f elasticsearch-client.yaml
+      - |
+        STATUS=$(kubectl get pods -n monitoring | grep elasticsearch-client | grep Running)
+        while [ -z "$STATUS" ]
+        do
+          sleep 5
+          STATUS=$(kubectl get pods -n monitoring | grep elasticsearch-client | grep Running)
+        done
+      #- kubectl delete secret elasticsearch-pw-elastic -n monitoring
+      - kubectl exec -it $(kubectl get pods -n monitoring | grep elasticsearch-client | sed -n 1p | awk '{print $1}') -n monitoring -- bin/elasticsearch-users useradd elasticuser -p $ELASTIC_PASSWORD -r superuser | true
+      - kubectl create secret generic elasticsearch-pw-elastic -n monitoring --from-literal password=$ELASTIC_PASSWORD
+      - kubectl apply -f kibana.yaml 
+      - kubectl apply -f fluentd.yaml 
+      - kubectl apply -f kibana-ingress.yaml 

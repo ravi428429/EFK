@@ -1,0 +1,184 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: monitoring
+data:
+  fluent.conf: |
+    <match fluent.**>
+        # this tells fluentd to not output its log on stdout
+        @type null
+    </match>
+    # here we read the logs from Docker's containers and parse them
+    <source>
+      @type tail
+      path /var/log/containers/*.log
+      pos_file /var/log/app.log.pos
+      tag kubernetes.*
+      read_from_head true
+      <parse>
+        @type json
+        time_format %Y-%m-%dT%H:%M:%S.%NZ
+      </parse>
+    </source>
+    # we use kubernetes metadata plugin to add metadatas to the log
+    <filter kubernetes.**>
+        @type kubernetes_metadata
+    </filter>
+
+    <match kubernetes.var.log.containers.**kube-logging**.log>
+    @type null
+    </match>
+
+    <match kubernetes.var.log.containers.**kube-system**.log>
+    @type null
+    </match>
+
+    <match kubernetes.var.log.containers.**monitoring**.log>
+    @type null
+    </match>
+
+    <match kubernetes.var.log.containers.**infra**.log>
+    @type null
+    </match>
+
+    <match kubernetes.var.log.containers.**fluentd**.log>
+    @type null
+    </match>
+
+     # we send the logs to Elasticsearch
+    <match **>
+       @type elasticsearch_dynamic
+       @log_level info
+       include_tag_key true
+       host "#{ENV['FLUENT_ELASTICSEARCH_HOST']}"
+       port "#{ENV['FLUENT_ELASTICSEARCH_PORT']}"
+       user "#{ENV['FLUENT_ELASTICSEARCH_USER']}"
+       password "#{ENV['FLUENT_ELASTICSEARCH_PASSWORD']}"
+       scheme "#{ENV['FLUENT_ELASTICSEARCH_SCHEME'] || 'http'}"
+       ssl_verify "#{ENV['FLUENT_ELASTICSEARCH_SSL_VERIFY'] || 'true'}"
+       reload_connections true
+       logstash_format true
+       logstash_prefix ${record['kubernetes']['namespace_name']}
+       enable_ilm true
+       ilm_policy_id "clear-old-indices"
+       ilm_policy_overwrite false
+       log_es_400_reason true
+       ilm_policy {"policy":{"phases":{"hot":{"min_age":"0ms","actions":{"rollover":{"max_age":"3d","max_size":"10gb"}}},"delete":{"min_age":"1d","actions":{"delete":{}}}}}}
+       <buffer>
+           @type file
+           path /var/log/fluentd-buffers/kubernetes.system.buffer
+           flush_mode interval
+           retry_type exponential_backoff
+           flush_thread_count 2
+           flush_interval 5s
+           retry_forever true
+           retry_max_interval 30
+           chunk_limit_size 2M
+           queue_limit_length 32
+           overflow_action block
+       </buffer>
+    </match>
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluentd
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluentd
+  namespace: monitoring
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: fluentd
+roleRef:
+  kind: ClusterRole
+  name: fluentd
+  apiGroup: rbac.authorization.k8s.io
+subjects:
+- kind: ServiceAccount
+  name: fluentd
+  namespace: monitoring
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: monitoring
+  labels:
+    app: fluentd
+spec:
+  selector:
+    matchLabels:
+      app: fluentd  
+  template:
+    metadata:
+      labels:
+        app: fluentd
+    spec:
+      serviceAccount: fluentd # if RBAC is enabled
+      serviceAccountName: fluentd # if RBAC is enabled
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+      containers:
+      - name: fluentd
+        image: fluent/fluentd-kubernetes-daemonset:v1.14.5-debian-elasticsearch7-1.1
+        env:
+        - name:  FLUENT_ELASTICSEARCH_HOST
+          value: "elasticsearch-client"
+        - name:  FLUENT_ELASTICSEARCH_PORT
+          value: "9200"
+        - name: FLUENT_ELASTICSEARCH_SCHEME
+          value: "http"
+        - name: FLUENT_ELASTICSEARCH_USER # even if not used they are necessary
+          value: "elasticuser"
+        - name: FLUENT_ELASTICSEARCH_PASSWORD # even if not used they are necessary
+          valueFrom:
+            secretKeyRef:
+              name: elasticsearch-pw-elastic
+              key: password
+        - name: FLUENT_ELASTICSEARCH_ENABLE_ILM
+          value: "true"
+        - name: FLUENT_ELASTICSEARCH_ILM_POLICY
+          value: '{ "policy": { "phases": { "hot": { "min_age": "0ms", "actions": { "rollover": { "max_age": "1d", "max_size": "5gb" } } }, "delete": { "min_age": "2d", "actions": { "delete": {}}}}}}'
+        resources:
+          limits:
+            memory: 2Gi
+          requests:
+            cpu: 300m
+            memory: 2Gi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: fluentd-config
+          mountPath: /fluentd/etc # path of fluentd config file
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: fluentd-config
+        configMap:
+          name: fluentd-config # name of the config map we will create
